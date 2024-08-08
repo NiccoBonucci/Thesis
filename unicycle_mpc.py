@@ -1,3 +1,4 @@
+
 from casadi import *
 import casadi as cs
 
@@ -20,7 +21,7 @@ dt    = Tf/Nhor             # sample time
 current_X = vertcat(0,0,0)  # initial state
 final_X   = vertcat(3,4,0)    # desired terminal state
 
-Nsim  = 50                  # how much samples to simulate
+Nsim  = 34                  # how much samples to simulate
 add_noise = True            # enable/disable the measurement noise addition in simulation
 add_disturbance = False      # enable/disable the disturbance addition in simulation
 
@@ -74,10 +75,7 @@ ocp.subject_to(-10 <= (x <= 10), include_first=False)
 ocp.subject_to(-10 <= (y <= 10), include_first=False)
 
 # Pick a solution method
-options = {"ipopt": {"print_level": 0}}
-options["expand"] = True
-options["print_time"] = False
-ocp.solver('ipopt',options)
+ocp.solver('ipopt')
 
 method = MultipleShooting(N=Nhor, M=4, intg='rk')
 ocp.method(method)
@@ -92,6 +90,31 @@ ocp.set_value(X_0, current_X)
 # Solve
 sol = ocp.solve()
 
+###################################################
+############ Grafico soluzione iniziale ###########
+###################################################
+
+figure()
+
+ts, xs = sol.sample(x, grid='control')
+ts, ys = sol.sample(y, grid='control')
+
+plot(xs, ys,'bo')
+
+ts, xs = sol.sample(x, grid='integrator')
+ts, ys = sol.sample(y, grid='integrator')
+
+plot(xs, ys, 'b.')
+
+ts, xs = sol.sample(x, grid='integrator',refine=10)
+ts, ys = sol.sample(y, grid='integrator',refine=10)
+
+plot(xs, ys, '-')
+
+axis('equal')
+show(block=True)
+
+
 Sim_unycicle_dyn = ocp._method.discrete_system(ocp)
 
 # Log data for post-processing
@@ -102,7 +125,9 @@ theta_history[0] = current_X[2]
 DM.rng(0)
 
 for i in range(Nsim):
+    print("   ")
     print("timestep", i+1, "of", Nsim)
+    print("   ")
 
     # Get the solution from sol
     tsa, Fsol = sol.sample(F, grid='control')
@@ -110,6 +135,7 @@ for i in range(Nsim):
 
     # Simulate dynamics and update the current state
     current_X = Sim_unycicle_dyn(x0=current_X, u=F_sol_first, T=dt)["xf"]
+    print(current_X)
 
     # Add disturbance at t = 2*Tf
     if add_disturbance:
@@ -134,30 +160,6 @@ for i in range(Nsim):
 
 print("Plot the results")
 
-"""
-time_sim = np.linspace(0, dt*Nsim, Nsim+1)
-
-figure()
-
-ts, xs = sol.sample(x, grid='control')
-ts, ys = sol.sample(y, grid='control')
-
-plot(xs, ys,'bo')
-
-ts, xs = sol.sample(x, grid='integrator')
-ts, ys = sol.sample(y, grid='integrator')
-
-plot(xs, ys, 'b.')
-
-ts, xs = sol.sample(x, grid='integrator',refine=10)
-ts, ys = sol.sample(y, grid='integrator',refine=10)
-
-plot(xs, ys, '-')
-
-axis('equal')
-show(block=True)
-"""
-
 # Plotting the trajectory
 plt.figure()
 plt.plot(x_history, y_history, marker='o')
@@ -165,6 +167,9 @@ plt.title('Traiettoria del robot uniciclo')
 plt.xlabel('Posizione X [m]')
 plt.ylabel('Posizione Y [m]')
 plt.grid(True)
+plt.axis('scaled')
+"""
 plt.xlim(-2, 5)  # limiti dell'asse X (aggiustabili in base ai tuoi vincoli)
 plt.ylim(-2, 5)  # limiti dell'asse Y (aggiustabili in base ai tuoi vincoli)
+"""
 plt.show()

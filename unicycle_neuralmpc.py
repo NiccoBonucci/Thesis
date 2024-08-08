@@ -4,19 +4,16 @@ import l4casadi as l4c
 
 from casadi import *
 import casadi as cs
-from casadi import vertcat
 
 from rockit import *
 
-from pylab import *
 import numpy as np
 import matplotlib.pyplot as plt
 
 from acados_template import AcadosOcpSolver, AcadosOcp, AcadosModel
 import time
 
-add_disturbance = False
-add_noise = False
+COST = 'LINEAR_LS'  # NONLINEAR_LS
 
 class PyTorchModel(torch.nn.Module):
     def __init__(self):
@@ -43,163 +40,438 @@ class PyTorchModel(torch.nn.Module):
         x = self.out_layer(x)
         return x
 
-nx    = 3                   # the system is composed of 4 states
-nu    = 2                   # the system has 1 input
-Tf    = 5.0                 # control horizon [s]
-Nhor  = 50                  # number of control intervals
-dt    = Tf/Nhor             # sample time
+class UnicycleWithLearnedDynamics:
+    def __init__(self, learned_dyn):
+        self.learned_dyn = learned_dyn
 
-current_X = cs.vertcat(0,0,0)  # initial state
-final_X   = cs.vertcat(3,4,0)    # desired terminal state
+    def model(self):
+        x = cs.MX.sym('x', 1)
+        y = cs.MX.sym('y', 1)
+        theta = cs.MX.sym('theta', 1)
+        v = cs.MX.sym('v', 1)
+        omega = cs.MX.sym('omega', 1)
+        
+        # Stato
+        state = cs.vertcat(x, y, theta)
+        # Controlli
+        controls = cs.vertcat(v, omega)
+        
+        # Stati uniti ai controlli per passare alla rete neurale
+        state_with_controls = cs.vertcat(state, controls)
 
-Nsim  = 100                  # how much samples to simulate
-add_noise = False            # enable/disable the measurement noise addition in simulation
-add_disturbance = False      # enable/disable the disturbance addition in simulation
+        # Risultato del modello appreso
+        res_model = self.learned_dyn(state_with_controls)
 
-# -------------------------------
-# Logging variables
-# -------------------------------
-x_history = np.zeros(Nsim+1)
-y_history = np.zeros(Nsim+1)
-theta_history = np.zeros(Nsim+1)
-u_history = np.zeros((Nsim, 2))
-# -------------------------------
-# Set OCP
-# -------------------------------
-ocp = Ocp(T=FreeTime(Tf))
+        dx = res_model[0]
+        dy = res_model[1]
+        dtheta = res_model[2]
 
-# Define states
-x = ocp.state()  # [m]
-y = ocp.state()  # [m]
-theta  = ocp.state()  # [rad]
-X = cs.vertcat(x,y,theta)
+        x_start = np.zeros((3, ))  # Stato iniziale corretto
 
-# Define controls
+        model = cs.types.SimpleNamespace()
+        model.x = state
+        model.xdot = cs.vertcat(dx, dy, dtheta)
+        model.u = controls
+        model.z = cs.vertcat([])
+        model.p = cs.vertcat([])
+        model.f_expl = cs.vertcat(dx, dy, dtheta)
+        model.x_start = x_start
+        model.constraints = cs.vertcat([])
+        model.name = "unicycle"
 
-V = ocp.control()
-omega = ocp.control()
-
-F = vertcat(V, omega)
-
-# Specify ODE
-ocp.set_der(x, V * cs.cos(theta))
-ocp.set_der(y, V * cs.sin(theta))
-ocp.set_der(theta, omega)
-
-# Define parameter
-X_0 = ocp.parameter(nx)
-
-# Initial constraint
-ocp.subject_to(ocp.at_t0(X)==X_0)
-
-# Final constraint
-ocp.subject_to(ocp.at_tf(X)==final_X)
-
-# Path constraints
-ocp.set_initial(x,0)
-ocp.set_initial(y,ocp.t)
-ocp.set_initial(theta, 0)
-ocp.set_initial(V,1)
-ocp.set_initial(omega,0)
-
-ocp.subject_to(0 <= (V<=2))
-ocp.subject_to( -pi <= (omega<= pi))
-ocp.subject_to(-10 <= (x <= 10), include_first=False)
-ocp.subject_to(-10 <= (y <= 10), include_first=False)
-
-# Pick a solution method
-options = {"ipopt": {"print_level": 0}}
-options["expand"] = True
-options["print_time"] = False
-ocp.solver('ipopt',options)
-
-method = MultipleShooting(N=Nhor, M=4, intg='rk')
-ocp.method(method)
-
-# Minimal time
-ocp.add_objective(ocp.T)
-ocp.add_objective(ocp.integral((x)**2 + (y)**2))
-
-# Set initial value for parameters
-ocp.set_value(X_0, current_X)
-
-# Solve
-sol = ocp.solve()
-
-############################################################################
-############# Definizione della dinamica tramite rete neurale ##############
-############################################################################
-
-#Define the dynamic system using the trained model and l4casADi
-PyTorch_model = PyTorchModel()
-PyTorch_model.load_state_dict(torch.load("unicycle_model_state.pth"))
-PyTorch_model.eval()
-learned_dyn_model = l4c.L4CasADi(PyTorch_model, model_expects_batch_dim=True, device='cpu')
-
-#Define the dynamic system's states and controls
-states = cs.MX.sym('states', nx, 1) 
-controls = cs.MX.sym('controls', nu, 1) 
-in_sym = cs.vertcat(states, controls)
-increment = learned_dyn_model(in_sym)  
-
-#Define the function to calculate the increment of the state
-Sim_unycicle_dyn = cs.Function('state_increment', 
-                           [in_sym], 
-                           [increment])
+        return model
 
 
-# Log data for post-processing
-x_history[0]   = current_X[0]
-x_history[0]   = current_X[1]
-theta_history[0] = current_X[2]
+class MPC:
+    def __init__(self, model, N, external_shared_lib_dir, external_shared_lib_name):
+        self.N = N
+        self.model = model
+        self.external_shared_lib_dir = external_shared_lib_dir
+        self.external_shared_lib_name = external_shared_lib_name
+
+    @property
+    def solver(self):
+        return AcadosOcpSolver(self.ocp())
+
+    def ocp(self):
+        model = self.model
+
+        t_horizon = 1.0
+        N = self.N
+
+        model_ac = self.acados_model(model=model)
+        model_ac.p = model.p
+
+        nx = 3  # 3 state variables (x, y, theta)
+        nu = 2  # 2 control inputs (v, omega)
+        ny = 3  # 3 outputs (dx, dy, dtheta)
+
+        ocp = AcadosOcp()
+        ocp.model = model_ac
+        ocp.dims.N = N
+        ocp.dims.nx = nx
+        ocp.dims.nu = nu
+        ocp.dims.ny = ny
+        ocp.solver_options.tf = t_horizon
+
+        if COST == 'LINEAR_LS':
+            ocp.cost.cost_type = 'LINEAR_LS'
+            ocp.cost.cost_type_e = 'LINEAR_LS'
+
+            ocp.cost.W = np.eye(ny)
+
+            ocp.cost.Vx = np.zeros((ny, nx))
+            ocp.cost.Vx[0, 0] = 1.0
+            ocp.cost.Vx[1, 1] = 1.0
+            ocp.cost.Vx[2, 2] = 1.0
+            ocp.cost.Vu = np.zeros((ny, nu))
+            ocp.cost.Vz = np.array([[]])
+            ocp.cost.Vx_e = np.zeros((ny, nx))
+
+            l4c_y_expr = None
+        else:
+            ocp.cost.cost_type = 'NONLINEAR_LS'
+            ocp.cost.cost_type_e = 'NONLINEAR_LS'
+
+            x = ocp.model.x
+
+            ocp.cost.W = np.eye(ny)
+
+            l4c_y_expr = l4c.L4CasADi(lambda x: x[0], name='y_expr')
+
+            ocp.model.cost_y_expr = l4c_y_expr(x)
+            ocp.model.cost_y_expr_e = x[0]
+
+        ocp.cost.W_e = np.zeros((ny, ny))
+        ocp.cost.yref_e = np.zeros(ny)
+
+        ocp.cost.yref = np.zeros(ny)
+
+        ocp.constraints.x0 = model.x_start
+
+        v_max = 1.0  # Maximum linear velocity
+        omega_max = np.pi / 4  # Maximum angular velocity
+        ocp.constraints.lbu = np.array([-v_max, -omega_max])
+        ocp.constraints.ubu = np.array([v_max, omega_max])
+        ocp.constraints.idxbu = np.array([0, 1])
+
+        ocp.solver_options.qp_solver = 'FULL_CONDENSING_HPIPM'
+        ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
+        ocp.solver_options.integrator_type = 'ERK'
+        ocp.solver_options.nlp_solver_type = 'SQP_RTI'
+        ocp.solver_options.model_external_shared_lib_dir = self.external_shared_lib_dir
+        if COST == 'LINEAR_LS':
+            ocp.solver_options.model_external_shared_lib_name = self.external_shared_lib_name
+        else:
+            ocp.solver_options.model_external_shared_lib_name = self.external_shared_lib_name + ' -l' + l4c_y_expr.name
+
+        return ocp
+
+    def acados_model(self, model):
+        model_ac = AcadosModel()
+        model_ac.f_impl_expr = model.xdot - model.f_expl
+        model_ac.f_expl_expr = model.f_expl
+        model_ac.x = model.x
+        model_ac.xdot = model.xdot
+        model_ac.u = model.u
+        model_ac.name = model.name
+        return model_ac
+
+def run():
+    N_hor = 10
+    t_hor = 2.0
+    learned_dyn_model = l4c.L4CasADi(PyTorchModel(), model_expects_batch_dim=True, name='learned_dyn')
+
+    model = UnicycleWithLearnedDynamics(learned_dyn_model)
+    solver = MPC(model=model.model(), N=N_hor,
+                 external_shared_lib_dir=learned_dyn_model.shared_lib_dir,
+                 external_shared_lib_name=learned_dyn_model.name).solver
+
+    x = []
+    x_ref = []
+
+    ts = t_hor / N_hor
+    xt = np.array([0.0, 0.0, 0.0])  # Initial state: x, y, theta
+    x_goal = np.array([5.0, 5.0, np.pi / 4])  # Goal state: x, y, theta
+    opt_times = []
+
+    for i in range(50):
+        now = time.time()
+        
+        # Imposta yref come lo stato finale per ogni istante temporale
+        yref = np.tile(x_goal, (N_hor, 1)).T
+
+        for t_idx in range(N_hor):
+            solver.set(t_idx, "yref", yref[:, t_idx])
+        solver.set(0, "lbx", xt)
+        solver.set(0, "ubx", xt)
+        solver.solve()
+        
+        # Ottieni i primi 3 stati (x, y, theta)
+        xt = solver.get(1, "x")[:3]
+        x.append(xt)
+
+        elapsed = time.time() - now
+        opt_times.append(elapsed)
+
+    print(f'Mean iteration time: {1000 * np.mean(opt_times):.1f} ms -- {1 / np.mean(opt_times):.0f} Hz)')
+
+    # Plot the results
+    x = np.array(x)
+    plt.figure()
+    plt.plot(x[:, 0], x[:, 1], label='Traiettoria')
+    plt.plot(x_goal[0], x_goal[1], 'ro', label='Stato Finale')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.title('Traiettoria dell\'Uniciclo')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    # Controlli v e omega
+    v = [solver.get(i, 'u')[0] for i in range(N_hor)]
+    omega = [solver.get(i, 'u')[1] for i in range(N_hor)]
+
+    plt.figure()
+    plt.subplot(2, 1, 1)
+    plt.plot(v)
+    plt.ylabel('v')
+    plt.grid()
+    plt.title('Controlli nel tempo')
+    
+    plt.subplot(2, 1, 2)
+    plt.plot(omega)
+    plt.ylabel('omega')
+    plt.xlabel('Tempo (passi)')
+    plt.grid()
+    plt.show()
+
+
+if __name__ == '__main__':
+    run()
+
+
+
 
 """
-DM.rng(0)
+import torch
+import torch.nn as nn
+import l4casadi as l4c
+
+from casadi import *
+import casadi as cs
+
+from rockit import *
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from acados_template import AcadosOcpSolver, AcadosOcp, AcadosModel
+import time
+
+COST = 'LINEAR_LS'  # NONLINEAR_LS
+
+class PyTorchModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.input_layer = torch.nn.Linear(5, 512)
+
+        hidden_layers = []
+        for i in range(5):
+            hidden_layers.append(torch.nn.Linear(512, 512))
+
+        self.hidden_layer = torch.nn.ModuleList(hidden_layers)
+        self.out_layer = torch.nn.Linear(512, 3)
+
+        # Model is not trained -- setting output to zero
+        with torch.no_grad():
+            self.out_layer.bias.fill_(0.)
+            self.out_layer.weight.fill_(0.)
+
+    def forward(self, x):
+        x = self.input_layer(x)
+        for layer in self.hidden_layer:
+            x = torch.relu(layer(x))
+        x = self.out_layer(x)
+        return x
+
+class UnicycleWithLearnedDynamics:
+    def __init__(self, learned_dyn):
+        self.learned_dyn = learned_dyn
+
+    def model(self):
+        x = cs.MX.sym('x', 1)
+        y = cs.MX.sym('y', 1)
+        theta = cs.MX.sym('theta', 1)
+        v = cs.MX.sym('v', 1)
+        omega = cs.MX.sym('omega', 1)
+        
+        # Stato
+        state = cs.vertcat(x, y, theta)
+        # Controlli
+        controls = cs.vertcat(v, omega)
+        
+        # Stati uniti ai controlli per passare alla rete neurale
+        state_with_controls = cs.vertcat(state, controls)
+
+        # Risultato del modello appreso
+        res_model = self.learned_dyn(state_with_controls)
+
+        dx = res_model[0]
+        dy = res_model[1]
+        dtheta = res_model[2]
+
+        x_start = np.zeros((3, ))  # Stato iniziale corretto
+
+        model = cs.types.SimpleNamespace()
+        model.x = state
+        model.xdot = cs.vertcat(dx, dy, dtheta)
+        model.u = controls
+        model.z = cs.vertcat([])
+        model.p = cs.vertcat([])
+        model.f_expl = cs.vertcat(dx, dy, dtheta)
+        model.x_start = x_start
+        model.constraints = cs.vertcat([])
+        model.name = "unicycle"
+
+        return model
+
+
+class MPC:
+    def __init__(self, model, N, external_shared_lib_dir, external_shared_lib_name):
+        self.N = N
+        self.model = model
+        self.external_shared_lib_dir = external_shared_lib_dir
+        self.external_shared_lib_name = external_shared_lib_name
+
+    @property
+    def solver(self):
+        return AcadosOcpSolver(self.ocp())
+
+    def ocp(self):
+        model = self.model
+
+        t_horizon = 1.0
+        N = self.N
+
+        model_ac = self.acados_model(model=model)
+        model_ac.p = model.p
+
+        nx = 3  # 3 state variables (x, y, theta)
+        nu = 2  # 2 control inputs (v, omega)
+        ny = 3  # 3 outputs (dx, dy, dtheta)
+
+        ocp = AcadosOcp()
+        ocp.model = model_ac
+        ocp.dims.N = N
+        ocp.dims.nx = nx
+        ocp.dims.nu = nu
+        ocp.dims.ny = ny
+        ocp.solver_options.tf = t_horizon
+
+        if COST == 'LINEAR_LS':
+            ocp.cost.cost_type = 'LINEAR_LS'
+            ocp.cost.cost_type_e = 'LINEAR_LS'
+
+            ocp.cost.W = np.eye(ny)
+
+            ocp.cost.Vx = np.zeros((ny, nx))
+            ocp.cost.Vx[0, 0] = 1.0
+            ocp.cost.Vx[1, 1] = 1.0
+            ocp.cost.Vx[2, 2] = 1.0
+            ocp.cost.Vu = np.zeros((ny, nu))
+            ocp.cost.Vz = np.array([[]])
+            ocp.cost.Vx_e = np.zeros((ny, nx))
+
+            l4c_y_expr = None
+        else:
+            ocp.cost.cost_type = 'NONLINEAR_LS'
+            ocp.cost.cost_type_e = 'NONLINEAR_LS'
+
+            x = ocp.model.x
+
+            ocp.cost.W = np.eye(ny)
+
+            l4c_y_expr = l4c.L4CasADi(lambda x: x[0], name='y_expr')
+
+            ocp.model.cost_y_expr = l4c_y_expr(x)
+            ocp.model.cost_y_expr_e = x[0]
+
+        ocp.cost.W_e = np.zeros((ny, ny))
+        ocp.cost.yref_e = np.zeros(ny)
+
+        ocp.cost.yref = np.zeros(ny)
+
+        ocp.constraints.x0 = model.x_start
+
+        v_max = 1.0  # Maximum linear velocity
+        omega_max = np.pi / 4  # Maximum angular velocity
+        ocp.constraints.lbu = np.array([-v_max, -omega_max])
+        ocp.constraints.ubu = np.array([v_max, omega_max])
+        ocp.constraints.idxbu = np.array([0, 1])
+
+        ocp.solver_options.qp_solver = 'FULL_CONDENSING_HPIPM'
+        ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
+        ocp.solver_options.integrator_type = 'ERK'
+        ocp.solver_options.nlp_solver_type = 'SQP_RTI'
+        ocp.solver_options.model_external_shared_lib_dir = self.external_shared_lib_dir
+        if COST == 'LINEAR_LS':
+            ocp.solver_options.model_external_shared_lib_name = self.external_shared_lib_name
+        else:
+            ocp.solver_options.model_external_shared_lib_name = self.external_shared_lib_name + ' -l' + l4c_y_expr.name
+
+        return ocp
+
+    def acados_model(self, model):
+        model_ac = AcadosModel()
+        model_ac.f_impl_expr = model.xdot - model.f_expl
+        model_ac.f_expl_expr = model.f_expl
+        model_ac.x = model.x
+        model_ac.xdot = model.xdot
+        model_ac.u = model.u
+        model_ac.name = model.name
+        return model_ac
+
+def run():
+    N_hor = 10
+    t_hor = 2.0
+    learned_dyn_model = l4c.L4CasADi(PyTorchModel(), model_expects_batch_dim=True, name='learned_dyn')
+
+    model = UnicycleWithLearnedDynamics(learned_dyn_model)
+    solver = MPC(model=model.model(), N=N_hor,
+                 external_shared_lib_dir=learned_dyn_model.shared_lib_dir,
+                 external_shared_lib_name=learned_dyn_model.name).solver
+
+    x = []
+    x_ref = []
+    ts = t_hor / N_hor
+    xt = np.array([0.0, 0.0, 0.0])  # Initial state: x, y, theta
+    opt_times = []
+
+    for i in range(50):
+        now = time.time()
+        t = np.linspace(i * ts, i * ts + ts, 10)
+        yref = np.array([np.sin(0.5 * t + np.pi / 2), np.cos(0.5 * t + np.pi / 2), np.zeros_like(t)])
+        x_ref.append(yref[:, 0])
+        for t_idx, ref in enumerate(yref.T):
+            solver.set(t_idx, "yref", ref)
+        solver.set(0, "lbx", xt)
+        solver.set(0, "ubx", xt)
+        solver.solve()
+        xt = solver.get(1, "x")[:3]  # Ottieni i primi 3 stati (x, y, theta)
+        x.append(xt)
+
+        x_l = []
+        for i in range(N_hor):
+            x_l.append(solver.get(i, "x")[:3])  # Ottieni i primi 3 stati (x, y, theta)
+
+        elapsed = time.time() - now
+        opt_times.append(elapsed)
+
+    print(f'Mean iteration time: {1000 * np.mean(opt_times):.1f} ms -- {1 / np.mean(opt_times):.0f} Hz)')
+
+
+if __name__ == '__main__':
+    run()
 """
-
-for i in range(Nsim):
-    print("timestep", i+1, "of", Nsim)
-    # Get the solution from sol
-    tsa, Fsol = sol.sample(F, grid='control')
-    F_sol_first = Fsol[0, :]
-    inputs = cs.vertcat(current_X, F_sol_first)
-    # Simulate dynamics and update the current state
-    next_state_increment = Sim_unycicle_dyn(inputs)
-    current_X = current_X + next_state_increment
-    # Add disturbance at t = 2*Tf
-    if add_disturbance:
-        if i == round(2*Nhor)-1:
-            disturbance = vertcat(0,0,-1e-1)
-            current_X = current_X + disturbance
-    # Add measurement noise
-    if add_noise:
-        meas_noise = 5e-4*(DM.rand(nx,1)-vertcat(1,1,1)) # 3x1 vector with values in [-1e-3, 1e-3]
-        current_X = current_X + meas_noise
-    
-    print(current_X)
-    
-    # Set the parameter X0 to the new current_X
-    ocp.set_value(X_0, current_X[:3])
-
-    # Solve the optimization problem
-    sol = ocp.solve()
-
-    x_history[i+1] = current_X[0].full()
-    y_history[i+1] = current_X[1].full()
-    theta_history[i+1] = current_X[2].full()
-    u_history[i,:] = F_sol_first
-
-print("Plot the results")
-
-# Plotting the trajectory
-plt.figure()
-plt.plot(x_history, y_history, marker='o')
-plt.title('Traiettoria del robot uniciclo')
-plt.xlabel('Posizione X [m]')
-plt.ylabel('Posizione Y [m]')
-plt.grid(True)
-plt.xlim(-2, 5)  # limiti dell'asse X (aggiustabili in base ai tuoi vincoli)
-plt.ylim(-2, 5)  # limiti dell'asse Y (aggiustabili in base ai tuoi vincoli)
-plt.show()
-
-
