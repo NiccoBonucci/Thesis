@@ -86,15 +86,14 @@ ocp.set_der(x, V * cs.cos(theta))
 ocp.set_der(y, V * cs.sin(theta))
 ocp.set_der(theta, omega)
 
-# Initial constraints
-ocp.subject_to(ocp.at_t0(x)==0)
-ocp.subject_to(ocp.at_t0(y)==0)
-ocp.subject_to(ocp.at_t0(theta)==0)
+# Define parameter
+X_0 = ocp.parameter(nx)
+
+# Initial constraint
+ocp.subject_to(ocp.at_t0(X)==X_0)
 
 # Final constraint
-ocp.subject_to(ocp.at_tf(x)==3)
-ocp.subject_to(ocp.at_tf(y)==4)
-ocp.subject_to(ocp.at_tf(theta)==3.14)
+ocp.subject_to(ocp.at_tf(X)==final_X)
 
 # Path constraints
 ocp.set_initial(x,0)
@@ -121,8 +120,15 @@ ocp.method(method)
 ocp.add_objective(ocp.T)
 ocp.add_objective(ocp.integral((x)**2 + (y)**2))
 
+# Set initial value for parameters
+ocp.set_value(X_0, current_X)
+
 # Solve
 sol = ocp.solve()
+
+############################################################################
+############# Definizione della dinamica tramite rete neurale ##############
+############################################################################
 
 #Define the dynamic system using the trained model and l4casADi
 PyTorch_model = PyTorchModel()
@@ -130,14 +136,16 @@ PyTorch_model.load_state_dict(torch.load("unicycle_model_state.pth"))
 PyTorch_model.eval()
 learned_dyn_model = l4c.L4CasADi(PyTorch_model, model_expects_batch_dim=True, device='cpu')
 
+#Define the dynamic system's states and controls
 states = cs.MX.sym('states', nx, 1) 
 controls = cs.MX.sym('controls', nu, 1) 
 in_sym = cs.vertcat(states, controls)
-delta = learned_dyn_model(in_sym)  
+increment = learned_dyn_model(in_sym)  
 
+#Define the function to calculate the increment of the state
 Sim_unycicle_dyn = cs.Function('state_increment', 
                            [in_sym], 
-                           [delta])
+                           [increment])
 
 
 # Log data for post-processing
@@ -156,8 +164,8 @@ for i in range(Nsim):
     F_sol_first = Fsol[0, :]
     inputs = cs.vertcat(current_X, F_sol_first)
     # Simulate dynamics and update the current state
-    increment = Sim_unycicle_dyn(inputs)
-    current_X = current_X + increment
+    next_state_increment = Sim_unycicle_dyn(inputs)
+    current_X = current_X + next_state_increment
     # Add disturbance at t = 2*Tf
     if add_disturbance:
         if i == round(2*Nhor)-1:
@@ -167,14 +175,19 @@ for i in range(Nsim):
     if add_noise:
         meas_noise = 5e-4*(DM.rand(nx,1)-vertcat(1,1,1)) # 3x1 vector with values in [-1e-3, 1e-3]
         current_X = current_X + meas_noise
-        
+    
+    print(current_X)
+    
+    # Set the parameter X0 to the new current_X
+    ocp.set_value(X_0, current_X[:3])
+
     # Solve the optimization problem
     sol = ocp.solve()
 
     x_history[i+1] = current_X[0].full()
     y_history[i+1] = current_X[1].full()
     theta_history[i+1] = current_X[2].full()
-    u_history[i-1,:] = F_sol_first
+    u_history[i,:] = F_sol_first
 
 print("Plot the results")
 
@@ -185,8 +198,8 @@ plt.title('Traiettoria del robot uniciclo')
 plt.xlabel('Posizione X [m]')
 plt.ylabel('Posizione Y [m]')
 plt.grid(True)
-plt.xlim(-10, 10)  # limiti dell'asse X (aggiustabili in base ai tuoi vincoli)
-plt.ylim(-10, 10)  # limiti dell'asse Y (aggiustabili in base ai tuoi vincoli)
+plt.xlim(-2, 5)  # limiti dell'asse X (aggiustabili in base ai tuoi vincoli)
+plt.ylim(-2, 5)  # limiti dell'asse Y (aggiustabili in base ai tuoi vincoli)
 plt.show()
 
 

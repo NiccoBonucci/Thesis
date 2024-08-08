@@ -20,7 +20,7 @@ dt    = Tf/Nhor             # sample time
 current_X = vertcat(0,0,0)  # initial state
 final_X   = vertcat(3,4,0)    # desired terminal state
 
-Nsim  = 100                  # how much samples to simulate
+Nsim  = 50                  # how much samples to simulate
 add_noise = True            # enable/disable the measurement noise addition in simulation
 add_disturbance = False      # enable/disable the disturbance addition in simulation
 
@@ -43,10 +43,8 @@ theta  = ocp.state()  # [rad]
 X = vertcat(x,y,theta)
 
 # Define controls
-
 V = ocp.control()
 omega = ocp.control()
-
 F = vertcat(V, omega)
 
 # Specify ODE
@@ -54,15 +52,14 @@ ocp.set_der(x, V * cs.cos(theta))
 ocp.set_der(y, V * cs.sin(theta))
 ocp.set_der(theta, omega)
 
-# Initial constraints
-ocp.subject_to(ocp.at_t0(x)==0)
-ocp.subject_to(ocp.at_t0(y)==0)
-ocp.subject_to(ocp.at_t0(theta)==0)
+# Define parameter
+X_0 = ocp.parameter(nx)
+
+# Initial constraint
+ocp.subject_to(ocp.at_t0(X)==X_0)
 
 # Final constraint
-ocp.subject_to(ocp.at_tf(x)==3)
-ocp.subject_to(ocp.at_tf(y)==4)
-ocp.subject_to(ocp.at_tf(theta)==3.14)
+ocp.subject_to(ocp.at_tf(X)==final_X)
 
 # Path constraints
 ocp.set_initial(x,0)
@@ -89,6 +86,9 @@ ocp.method(method)
 ocp.add_objective(ocp.T)
 ocp.add_objective(ocp.integral((x)**2 + (y)**2))
 
+# Set initial value for parameters
+ocp.set_value(X_0, current_X)
+
 # Solve
 sol = ocp.solve()
 
@@ -103,11 +103,14 @@ DM.rng(0)
 
 for i in range(Nsim):
     print("timestep", i+1, "of", Nsim)
+
     # Get the solution from sol
     tsa, Fsol = sol.sample(F, grid='control')
     F_sol_first = Fsol[0, :]
+
     # Simulate dynamics and update the current state
     current_X = Sim_unycicle_dyn(x0=current_X, u=F_sol_first, T=dt)["xf"]
+
     # Add disturbance at t = 2*Tf
     if add_disturbance:
         if i == round(2*Nhor)-1:
@@ -118,13 +121,16 @@ for i in range(Nsim):
         meas_noise = 5e-4*(DM.rand(nx,1)-vertcat(1,1,1)) # 3x1 vector with values in [-1e-3, 1e-3]
         current_X = current_X + meas_noise
 
+    # Set the parameter X0 to the new current_X
+    ocp.set_value(X_0, current_X[:3])
+
     # Solve the optimization problem
     sol = ocp.solve()
 
     x_history[i+1] = current_X[0].full()
     y_history[i+1] = current_X[1].full()
     theta_history[i+1] = current_X[2].full()
-    u_history[i-1,:] = F_sol_first
+    u_history[i,:] = F_sol_first
 
 print("Plot the results")
 
@@ -159,6 +165,6 @@ plt.title('Traiettoria del robot uniciclo')
 plt.xlabel('Posizione X [m]')
 plt.ylabel('Posizione Y [m]')
 plt.grid(True)
-plt.xlim(-10, 10)  # limiti dell'asse X (aggiustabili in base ai tuoi vincoli)
-plt.ylim(-10, 10)  # limiti dell'asse Y (aggiustabili in base ai tuoi vincoli)
+plt.xlim(-2, 5)  # limiti dell'asse X (aggiustabili in base ai tuoi vincoli)
+plt.ylim(-2, 5)  # limiti dell'asse Y (aggiustabili in base ai tuoi vincoli)
 plt.show()
