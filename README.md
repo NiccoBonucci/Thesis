@@ -1,5 +1,5 @@
 
-This Github contains all the files related to Niccolò Bonucci's Master Thesis
+Questo Github contiene tutti i file realtivi alla Tesi Magistrale di Niccolò Bonucci
 
 Regarding the files uploaded, here's a brief description of each one of them:
 - *rete_neurale_uniciclo.py* : codice Python per definire, addestrare e validare una rete neurale multipercettrone tramite Pytorch per la previsione delle equazioni che descrivono la dinamica dell'unicilo
