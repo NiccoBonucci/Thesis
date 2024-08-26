@@ -17,8 +17,8 @@ import time
 
 nx    = 3                   # the system is composed of 4 states
 nu    = 2                   # the system has 1 input
-Tf    = 10.0                 # control horizon [s]
-Nhor  = 50                  # number of control intervals
+Tf    = 1.0                 # control horizon [s]
+Nhor  = 20                # number of control intervals
 dt    = Tf/Nhor             # sample time
 
 current_X = vertcat(0,0,0)  # initial state
@@ -51,6 +51,19 @@ PyTorch_model = PyTorchModel()
 PyTorch_model.load_state_dict(torch.load("unicycle_model_state_simple.pth"))
 PyTorch_model.eval()
 learned_dyn = l4c.L4CasADi(PyTorch_model, model_expects_batch_dim=True, device='cpu')
+
+
+def random_input_test_std(l4c_model,):
+    # Generate 500 random inputs
+    x_sym = cs.MX.sym('x', 5, 1)
+    y_sym = l4c_model(x_sym)
+    f = cs.Function('y', [x_sym], [y_sym])
+    for _ in range(10):
+        i_ = np.array([[np.random.uniform(0, 10), np.random.uniform(0, 2*np.pi), np.random.uniform(0, 10), np.random.uniform(0, 2*np.pi), 0]])
+        p_ = f(i_.reshape((5, 1)))
+        p_ = p_[0, 0]
+
+random_input_test_std(learned_dyn)
 
 # -------------------------------
 # Logging variables
@@ -110,9 +123,21 @@ ocp.subject_to( -5 <= (omega<= 5))
 #ocp.subject_to(-5 <= (y <= 5), include_first=False)
 ocp.subject_to( -np.pi <= (theta<= np.pi), include_first=False)
 
-ocp.solver('ipopt')
 
-method = MultipleShooting(N=Nhor, M=2, intg='rk')
+
+# Solver options
+opts = {"verbose": False,
+        "print_time": True,
+        "ipopt": {#"linear_solver": "ma27",  # "ma*" is faster!
+                    "max_iter": 100,
+                    'print_level': 5,
+                    'sb': 'yes',  # Suppress IPOPT banner
+                    'tol': 1e-2,
+                    'hessian_approximation': 'limited-memory'
+                  }}
+ocp.solver("ipopt", opts)
+
+method = MultipleShooting(N=Nhor, M=1, intg='rk')
 ocp.method(method)
 
 # Definizione dei pesi
