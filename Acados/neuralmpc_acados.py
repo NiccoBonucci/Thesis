@@ -18,13 +18,6 @@ x_start = np.array([0,0,0])         # initial state
 x_final   = np.array([4,4,np.pi/2])   # desired terminal state values
 f_final   = np.array([0,0])     # desired final control values
 
-# Definizione dei pesi
-w_x = 1.0  # Peso per x
-w_y = 1.0  # Peso per y
-w_theta = 5.0  # Peso maggiore per l'orientamento theta
-w_vlin = 1.0  # Peso per l'input di controllo (sforzo minimo)
-w_omega = 1.0  # Peso per l'input di controllo (sforzo minimo)
-
 # MPC parameters
 t_horizon = 5.0
 N = 30
@@ -152,8 +145,8 @@ class UnicycleWithLearnedDynamics:
         model.p = p
         model.f_expl = f_expl
         model.f_impl = f_impl 
-        model.cost_y_expr = cs.vertcat(states, controls, derivatives)
-        model.cost_y_expr_e = cs.vertcat(states, derivatives)
+        model.cost_y_expr = cs.vertcat(states, controls)
+        model.cost_y_expr_e = cs.vertcat(states)
         model.x_start = x_start
         model.x_final = x_final
         model.f_final = f_final
@@ -227,21 +220,31 @@ class MPC:
         ocp.cost.cost_type = 'LINEAR_LS'
         ocp.cost.cost_type_e = 'LINEAR_LS'
 
-        ocp.cost.W = np.diag([w_x, w_y, w_theta, w_vlin, w_omega])
-        ocp.cost.W_e = np.diag([w_x, w_y, w_theta])
+        # Definizione dei pesi
+        w_x = 1.0  # Peso per x
+        w_y = 1.0  # Peso per y
+        w_theta = 5.0  # Peso maggiore per l'orientamento theta
+        w_vlin = 1.0  # Peso per l'input di controllo (sforzo minimo)
+        w_omega = 1.0  # Peso per l'input di controllo (sforzo minimo)
 
-        ocp.cost.Vx = np.zeros((5, 3))
+        W = np.diag([w_x, w_y, w_theta, w_vlin, w_omega])
+        W_e = np.diag([w_x, w_y, w_theta])
+
+        ocp.cost.W = W
+        ocp.cost.W_e = W_e
+
+        ocp.cost.Vx = np.zeros((ny, nx))
         ocp.cost.Vx[:3, :3] = np.eye(3)
         ocp.cost.Vx_e = np.eye(3)
 
-        ocp.cost.Vu = np.zeros((5, 2))
+        ocp.cost.Vu = np.zeros((ny, nu))
         ocp.cost.Vu[3:, :] = np.eye(2)
 
         ocp.cost.Vz = np.array([[]])
 
         # Initial reference trajectory (will be overwritten)
-        ocp.cost.yref = np.array([x_final[0], x_final[1], x_final[2], f_final[0], f_final[1]])
-        ocp.cost.yref_e = np.array([x_final[0], x_final[1], x_final[2]])
+        ocp.cost.yref =  np.zeros([ny])
+        ocp.cost.yref_e = np.zeros([nx])
 
         """
         ocp.cost.yref_e = np.array([x_final[0], x_final[1], x_final[2]])
@@ -359,7 +362,6 @@ def run():
     plt.tight_layout()
     plt.show()
 
-
     for i in range(steps):
         now = time.time()
 
@@ -376,6 +378,7 @@ def run():
         # Recupera la prima azione di controllo ottima (velocità lineare e angolare)
         u_opt = solver.get(0, "u")
         u_history.append(u_opt)
+        print(u_opt)
 
         # Usa le equazioni dell'uniciclo per calcolare il nuovo stato
         dt = t_horizon / N
@@ -476,3 +479,4 @@ def run():
 
 if __name__ == '__main__':
     run()
+
