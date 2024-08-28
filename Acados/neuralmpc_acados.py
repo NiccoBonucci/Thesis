@@ -18,6 +18,13 @@ x_start = np.array([0,0,0])         # initial state
 x_final   = np.array([4,4,np.pi/2])   # desired terminal state values
 f_final   = np.array([0,0])     # desired final control values
 
+# Definizione dei pesi
+w_x = 1.0  # Peso per x
+w_y = 1.0  # Peso per y
+w_theta = 5.0  # Peso maggiore per l'orientamento theta
+w_vlin = 1.0  # Peso per l'input di controllo (sforzo minimo)
+w_omega = 1.0  # Peso per l'input di controllo (sforzo minimo)
+
 # MPC parameters
 t_horizon = 5.0
 N = 30
@@ -127,8 +134,8 @@ class UnicycleWithLearnedDynamics:
         xdot = cs.vertcat(x_dot, y_dot, theta_dot)
 
         derivatives = self.learned_dyn(inputs)
-        p = self.learned_dyn.get_sym_params()
-        parameter_values = self.learned_dyn.get_params(np.array([0,0,0,0,0]))
+        #p = self.learned_dyn.get_sym_params()
+        #parameter_values = self.learned_dyn.get_params(np.array([0,0,0,0,0]))
 
         # Definizione della dinamica esplicita del sistema
         f_expl = derivatives
@@ -142,25 +149,27 @@ class UnicycleWithLearnedDynamics:
         model.xdot = xdot  
         model.u = controls
         model.z = cs.vertcat([])
-        model.p = p
+        #model.p = p
         model.f_expl = f_expl
         model.f_impl = f_impl 
-        model.cost_y_expr = cs.vertcat(states, controls)
-        model.cost_y_expr_e = cs.vertcat(states)
+        model.cost_y_expr = cs.vertcat(states, controls, derivatives)
+        model.cost_y_expr_e = cs.vertcat(states, derivatives)
         model.x_start = x_start
         model.x_final = x_final
         model.f_final = f_final
-        model.parameter_values = parameter_values
+        #model.parameter_values = parameter_values
         model.constraints = cs.vertcat([])
         model.name = "unicycle_model"
 
         return model
 
 class MPC:
-    def __init__(self, model, N):
+    def __init__(self, model, N, external_shared_lib_dir, external_shared_lib_name):
         self.N = N
         self.model = model
-
+        self.external_shared_lib_dir = external_shared_lib_dir
+        self.external_shared_lib_name = external_shared_lib_name
+    
     @property
     def simulator(self):
         return AcadosSimSolver(self.sim())
@@ -177,7 +186,7 @@ class MPC:
 
         # Get model
         model_ac = self.acados_model(model=model)
-        model_ac.p = model.p
+        #model_ac.p = model.p
 
         # Create OCP object to formulate the optimization
         sim = AcadosSim()
@@ -205,7 +214,7 @@ class MPC:
 
         # Get model
         model_ac = self.acados_model(model=model)
-        model_ac.p = model.p
+        #model_ac.p = model.p
 
         # Create OCP object to formulate the optimization
         ocp = AcadosOcp()
@@ -220,31 +229,21 @@ class MPC:
         ocp.cost.cost_type = 'LINEAR_LS'
         ocp.cost.cost_type_e = 'LINEAR_LS'
 
-        # Definizione dei pesi
-        w_x = 1.0  # Peso per x
-        w_y = 1.0  # Peso per y
-        w_theta = 5.0  # Peso maggiore per l'orientamento theta
-        w_vlin = 1.0  # Peso per l'input di controllo (sforzo minimo)
-        w_omega = 1.0  # Peso per l'input di controllo (sforzo minimo)
+        ocp.cost.W = np.diag([w_x, w_y, w_theta, w_vlin, w_omega])
+        ocp.cost.W_e = np.diag([w_x, w_y, w_theta])
 
-        W = np.diag([w_x, w_y, w_theta, w_vlin, w_omega])
-        W_e = np.diag([w_x, w_y, w_theta])
-
-        ocp.cost.W = W
-        ocp.cost.W_e = W_e
-
-        ocp.cost.Vx = np.zeros((ny, nx))
+        ocp.cost.Vx = np.zeros((5, 3))
         ocp.cost.Vx[:3, :3] = np.eye(3)
         ocp.cost.Vx_e = np.eye(3)
 
-        ocp.cost.Vu = np.zeros((ny, nu))
+        ocp.cost.Vu = np.zeros((5, 2))
         ocp.cost.Vu[3:, :] = np.eye(2)
 
         ocp.cost.Vz = np.array([[]])
 
         # Initial reference trajectory (will be overwritten)
-        ocp.cost.yref =  np.zeros([ny])
-        ocp.cost.yref_e = np.zeros([nx])
+        ocp.cost.yref = np.array([x_final[0], x_final[1], x_final[2], f_final[0], f_final[1]])
+        ocp.cost.yref_e = np.array([x_final[0], x_final[1], x_final[2]])
 
         """
         ocp.cost.yref_e = np.array([x_final[0], x_final[1], x_final[2]])
@@ -275,7 +274,9 @@ class MPC:
         ocp.solver_options.integrator_type = 'ERK'
         ocp.solver_options.nlp_solver_type = 'SQP_RTI'
 
-        ocp.parameter_values = model.parameter_values
+        ocp.solver_options.model_external_shared_lib_dir = self.external_shared_lib_dir
+        ocp.solver_options.model_external_shared_lib_name = self.external_shared_lib_name
+        #ocp.parameter_values = model.parameter_values
 
         return ocp
 
@@ -296,12 +297,12 @@ def run():
     PyTorch_model = PyTorchModel()
     PyTorch_model.load_state_dict(torch.load("unicycle_model_state_off.pth"))
     PyTorch_model.eval()
-    learned_dyn_model = l4c.realtime.RealTimeL4CasADi(PyTorch_model, approximation_order=1)
-
-    # Definisci il modello dinamico dell'uniciclo con la rete neurale
+    learned_dyn_model = l4c.L4CasADi(PyTorch_model, model_expects_batch_dim=True) 
     model = UnicycleWithLearnedDynamics(learned_dyn_model)
-    solver = MPC(model=model.model(), N=N).solver
-    
+    solver = MPC(model=model.model(), N=N,
+                 external_shared_lib_dir=learned_dyn_model.shared_lib_dir,
+                 external_shared_lib_name=learned_dyn_model.name).solver
+    # Definisci il modello dinamico dell'uniciclo con la rete neurale
     """    
     print('Warming up model...')
     x_l = []
@@ -362,6 +363,7 @@ def run():
     plt.tight_layout()
     plt.show()
 
+
     for i in range(steps):
         now = time.time()
 
@@ -378,7 +380,6 @@ def run():
         # Recupera la prima azione di controllo ottima (velocità lineare e angolare)
         u_opt = solver.get(0, "u")
         u_history.append(u_opt)
-        print(u_opt)
 
         # Usa le equazioni dell'uniciclo per calcolare il nuovo stato
         dt = t_horizon / N
@@ -396,9 +397,9 @@ def run():
             x_state = solver.get(i, "x")
             u_control = solver.get(i, "u")
             x_l.append(np.hstack((x_state, u_control)))
-        params = learned_dyn_model.get_params(np.stack(x_l, axis=0))
-        for i in range(N):
-            solver.set(i, "p", params[i])
+        #params = learned_dyn_model.get_params(np.stack(x_l, axis=0))
+        #for i in range(N):
+        #    solver.set(i, "p", params[i])
 
         elapsed = time.time() - now
         opt_times.append(elapsed)
@@ -479,4 +480,3 @@ def run():
 
 if __name__ == '__main__':
     run()
-
